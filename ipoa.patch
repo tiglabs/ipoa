@@ -1,0 +1,106 @@
+diff -Nrpu linux-3.10.0-327.el7.orig/include/net/inet_sock.h linux-3.10.0-327.el7/include/net/inet_sock.h
+--- linux-3.10.0-327.el7.orig/include/net/inet_sock.h	2017-06-02 14:07:22.893191785 +0800
++++ linux-3.10.0-327.el7/include/net/inet_sock.h	2017-06-02 14:21:03.690213392 +0800
+@@ -51,6 +51,9 @@ struct ip_options {
+ 			srr_is_hit:1,
+ 			is_changed:1,
+ 			rr_needaddr:1,
++#ifdef CONFIG_IPOA
++			is_ipoa:1,
++#endif
+ 			ts_needtime:1,
+ 			ts_needaddr:1;
+ 	unsigned char	router_alert;
+diff -Nrpu linux-3.10.0-327.el7.orig/include/uapi/linux/ip.h linux-3.10.0-327.el7/include/uapi/linux/ip.h
+--- linux-3.10.0-327.el7.orig/include/uapi/linux/ip.h	2017-06-02 14:07:22.929191786 +0800
++++ linux-3.10.0-327.el7/include/uapi/linux/ip.h	2017-06-02 14:21:15.524213703 +0800
+@@ -63,6 +63,10 @@
+ #define IPOPT_SSRR	(9 |IPOPT_CONTROL|IPOPT_COPY)
+ #define IPOPT_RA	(20|IPOPT_CONTROL|IPOPT_COPY)
+ 
++#ifdef CONFIG_IPOA
++#define IPOPT_IPOA  (31|IPOPT_CONTROL)
++#endif
++
+ #define IPVERSION	4
+ #define MAXTTL		255
+ #define IPDEFTTL	64
+diff -Nrpu linux-3.10.0-327.el7.orig/net/ipv4/af_inet.c linux-3.10.0-327.el7/net/ipv4/af_inet.c
+--- linux-3.10.0-327.el7.orig/net/ipv4/af_inet.c	2017-06-02 14:07:23.022191788 +0800
++++ linux-3.10.0-327.el7/net/ipv4/af_inet.c	2017-06-02 14:17:57.062208479 +0800
+@@ -711,6 +711,16 @@ int inet_getname(struct socket *sock, st
+ 			return -ENOTCONN;
+ 		sin->sin_port = inet->inet_dport;
+ 		sin->sin_addr.s_addr = inet->inet_daddr;
++
++#ifdef CONFIG_IPOA
++		if (sk->sk_user_data) {
++			__be64 ipoa_data;
++
++			memcpy(&ipoa_data, &sk->sk_user_data, sizeof(__be64));
++			sin->sin_port = (__be16)((ipoa_data >> 32) & 0x00ff);
++			sin->sin_addr.s_addr = (__be32)ipoa_data;
++		}
++#endif
+ 	} else {
+ 		__be32 addr = inet->inet_rcv_saddr;
+ 		if (!addr)
+diff -Nrpu linux-3.10.0-327.el7.orig/net/ipv4/ip_options.c linux-3.10.0-327.el7/net/ipv4/ip_options.c
+--- linux-3.10.0-327.el7.orig/net/ipv4/ip_options.c	2017-06-02 14:07:23.024191788 +0800
++++ linux-3.10.0-327.el7/net/ipv4/ip_options.c	2017-06-02 14:18:03.465208647 +0800
+@@ -292,6 +292,15 @@ int ip_options_compile(struct net *net,
+ 			goto error;
+ 		}
+ 		switch (*optptr) {
++#ifdef CONFIG_IPOA			
++			  case IPOPT_IPOA:
++			if (optlen != 8) {
++				pp_ptr = optptr + 1;
++				goto error;
++			}
++			opt->is_ipoa = 1;
++			break;
++#endif
+ 		      case IPOPT_SSRR:
+ 		      case IPOPT_LSRR:
+ 			if (optlen < 3) {
+diff -Nrpu linux-3.10.0-327.el7.orig/net/ipv4/ip_output.c linux-3.10.0-327.el7/net/ipv4/ip_output.c
+--- linux-3.10.0-327.el7.orig/net/ipv4/ip_output.c	2017-06-02 14:07:23.024191788 +0800
++++ linux-3.10.0-327.el7/net/ipv4/ip_output.c	2017-06-02 14:18:09.891208816 +0800
+@@ -1578,4 +1578,8 @@ void __init ip_init(void)
+ #if defined(CONFIG_IP_MULTICAST) && defined(CONFIG_PROC_FS)
+ 	igmp_mc_proc_init();
+ #endif
++
++#ifdef CONFIG_IPOA
++	printk(KERN_INFO "IPOA: load success.\n");
++#endif
+ }
+diff -Nrpu linux-3.10.0-327.el7.orig/net/ipv4/Kconfig linux-3.10.0-327.el7/net/ipv4/Kconfig
+--- linux-3.10.0-327.el7.orig/net/ipv4/Kconfig	2017-06-02 14:35:22.369235996 +0800
++++ linux-3.10.0-327.el7/net/ipv4/Kconfig	2017-06-02 14:35:45.929236616 +0800
+@@ -685,3 +685,8 @@ config TCP_MD5SIG
+ 	  on the Internet.
+ 
+ 	  If unsure, say N.
++
++config IPOA
++	tristate "IPv4 Option Address"
++	default n
++
+diff -Nrpu linux-3.10.0-327.el7.orig/net/ipv4/tcp_ipv4.c linux-3.10.0-327.el7/net/ipv4/tcp_ipv4.c
+--- linux-3.10.0-327.el7.orig/net/ipv4/tcp_ipv4.c	2017-06-02 14:07:23.028191788 +0800
++++ linux-3.10.0-327.el7/net/ipv4/tcp_ipv4.c	2017-06-02 14:18:21.070209111 +0800
+@@ -1401,6 +1401,12 @@ struct sock *tcp_v4_syn_recv_sock(struct
+ 		goto put_and_exit;
+ 	__inet_hash_nolisten(newsk, NULL);
+ 
++#ifdef CONFIG_IPOA
++	if (!newsk->sk_user_data && TCP_SKB_CB(skb)->header.h4.opt.is_ipoa) {
++		memcpy(&newsk->sk_user_data, &ip_hdr(skb)[1], sizeof(void *));
++	}
++#endif
++
+ 	return newsk;
+ 
+ exit_overflow:
